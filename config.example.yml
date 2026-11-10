@@ -1,0 +1,80 @@
+# Konfiguration für mahalanobis_service.py
+# ${VARIABLE} wird durch Umgebungsvariablen ersetzt (z. B. für Passwörter).
+# Dauern: 30s, 5m, 1h, 7d, 1h30m
+
+victoriametrics:
+  # Lesen (/api/v1/query_range wird angehängt)
+  #   Single-Node: http://<host>:8428
+  #   Cluster:     http://<vmselect>:8481/select/0/prometheus
+  read_url: http://localhost:8428
+  # Schreiben
+  #   Single-Node: http://<host>:8428/api/v1/import/prometheus
+  #   Cluster:     http://<vminsert>:8480/insert/0/prometheus/api/v1/import/prometheus
+  write_url: http://localhost:8428/api/v1/import/prometheus
+  # username: mahalanobis
+  # password: ${VM_PASSWORD}
+  # bearer_token: ${VM_TOKEN}
+  timeout: 60s
+  verify_tls: true            # true, false oder Pfad zu einem CA-Bundle
+  max_points_per_query: 10000 # längere Zeiträume werden in Teilabfragen gelesen
+
+schedule:
+  interval: 5m        # Abstand der Läufe
+  step: 1m            # Auflösung der gelesenen Daten (= Auflösung der Ergebnisse)
+  delay: 1m           # Abstand zu "jetzt", damit spät eintreffende Daten schon da sind
+  max_catchup: 1h     # nach einer Unterbrechung höchstens so weit zurück nachrechnen
+  # state_file: /data/state.json   # zuletzt verarbeiteter Zeitpunkt je Instanz (überlebt Neustarts)
+
+reference:
+  # Variante 1: gleitende Referenz – die letzten 7 Tage, endend 1 h vor jetzt
+  window: 7d
+  end_offset: 1h
+  refresh: 1h         # Referenz so oft neu laden und Kovarianz neu schätzen
+  # Variante 2: feste Referenz aus einem bekannten Normalbetrieb (ersetzt window/end_offset)
+  # start: "2026-10-01T00:00:00+02:00"
+  # end:   "2026-10-08T00:00:00+02:00"
+  # step: 5m          # Auflösung der Referenz (Standard: schedule.step)
+  min_points: 200     # Instanzen mit weniger vollständigen Referenzpunkten werden übersprungen
+  # Referenz je bewertetem Zeitpunkt t um die vorhergehenden Messpunkte t-1 ... t-N ergänzen.
+  # 0 = aus (Standard). Achtung: Bei anhaltenden Störungen gelangen gestörte Punkte in die
+  # Referenz und dämpfen D; erreichbar ist höchstens D ≈ Wurzel(Referenzpunkte / N).
+  # Bei 7 Tagen Referenz (≈ 10.000 Punkte) unkritisch, bei kurzer Referenz nicht verwenden.
+  # Siehe Modelldokumentation, Abschnitt "Keine aktuellen Messpunkte in der Referenz".
+  include_recent: 0
+
+analysis:
+  quantil: 0.99       # Quantil für die Anomalie-Schwelle
+  schwelle: chi2      # chi2 oder empirisch
+  robust: false       # true: robuste Kovarianz (MinCovDet, benötigt scikit-learn)
+  # Nur bei robust: true – Anteil der Referenzpunkte, aus dem Lage/Kovarianz geschätzt werden.
+  # Standard (leer) ist ca. 0.5: Bei Daten mit Tagesgang beschreibt das oft nur die ruhige
+  # Phase, normale Last gilt dann als anomal. Empfehlung: 0.9 und schwelle: empirisch.
+  # support_fraction: 0.9
+
+# Labels aus dem Query-Ergebnis, nach denen gruppiert wird. Jede Kombination wird
+# getrennt analysiert, und die Labels werden in die neuen Metriken übernommen.
+group_labels: [instance]
+
+# Merkmale: Name -> PromQL/MetricsQL-Query.
+# Jede Query muss genau EINE Zeitreihe je Instanz liefern und das Label "instance" behalten,
+# also ggf. mit "by (instance)" aggregieren.
+# Zähler (stetig steigende Werte wie *_bytes, *_total, net_bytes_recv) immer mit rate() verwenden:
+# Der Rohwert eines Zählers bildet nur die verstrichene Zeit ab, nicht die Last, und ein
+# Zähler-Reset (Neustart) erscheint als massive Anomalie.
+metrics:
+  temperatur: 'avg by (instance) (sensor_temperatur{job="anlage"})'
+  druck:      'avg by (instance) (sensor_druck{job="anlage"})'
+  drehzahl:   'avg by (instance) (motor_drehzahl{job="anlage"})'
+  # auch abgeleitete Größen sind möglich:
+  # strom_rate: 'sum by (instance) (rate(motor_strom_total{job="anlage"}[5m]))'
+
+output:
+  # feste Labels für alle neuen Metriken; "instance" kommt automatisch aus dem Query-Ergebnis
+  labels:
+    anlage: A1
+    modell: mahalanobis_v1
+  prefix: mahalanobis       # -> mahalanobis_d, mahalanobis_z{merkmal=...}, ...
+  mit_messwert: false       # zusätzlich mahalanobis_messwert{merkmal=...} schreiben
+  write_input: false        # Eingangsdaten zusätzlich als <input_prefix><merkmal> schreiben
+  input_prefix: mahalanobis_input_
+  service_metrics: true     # mahalanobis_service_instanzen{status=...}, ..._laufdauer_sekunden

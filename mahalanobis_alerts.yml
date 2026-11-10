@@ -1,0 +1,153 @@
+# Alerting-Regeln (vmalert) für die Mahalanobis-Anomalieerkennung
+#
+# Voraussetzungen
+#   - Metriken aus mahalanobis_service.py (mahalanobis_d, _schwelle_d, _anomalie, _z, _loo,
+#     _konstant_abweichung, _service_*)
+#   - Jede Instanz wird getrennt bewertet: Alle Verknüpfungen nutzen "ignoring(merkmal)",
+#     d. h. es wird über ALLE Labels (instance + output.labels) zugeordnet, nur das Label
+#     merkmal wird ignoriert. Die Regeln funktionieren dadurch unabhängig davon, welche
+#     festen Labels du in output.labels definierst.
+#   - Alle Schwellwerte (0.5, 3, 2, 1.5, Zeitfenster) sind Startwerte und an deine Daten anzupassen
+#
+# Grundprinzip: Kein Alarm auf einen einzelnen Messpunkt.
+#   Ein Event entsteht erst, wenn ein relevanter Anteil der Messungen in einem Zeitfenster
+#   anomal ist (avg_over_time(mahalanobis_anomalie[15m]) >= 0.5) UND das anhält (for).
+#   Die Fenster ([10m], [15m]) müssen mindestens so lang sein wie schedule.interval des Service
+#   plus schedule.delay, da die Werte blockweise nachgeschrieben werden.
+#
+# Die Regeln A und B schließen sich je Instanz gegenseitig aus:
+#   A  mindestens ein Merkmal hat |z| >= 3   -> Einzelmerkmal, wird benannt
+#   B  kein Merkmal hat |z| >= 3             -> Kombination/Korrelationsbruch
+
+groups:
+  - name: mahalanobis
+    interval: 1m
+    rules:
+
+      # A) Einzelmerkmal außerhalb des Normalbereichs (ein Alert je Instanz und Merkmal)
+      - alert: MerkmalAusserhalbNormalbereich
+        expr: |
+          (
+              last_over_time(mahalanobis_z[10m]) >= 3
+            or
+              last_over_time(mahalanobis_z[10m]) <= -3
+          )
+          and ignoring(merkmal)
+          avg_over_time(mahalanobis_anomalie[15m]) >= 0.5
+        for: 5m
+        keep_firing_for: 10m
+        labels:
+          severity: warning
+          typ: einzelmerkmal
+        annotations:
+          summary: >-
+            {{ $labels.instance }}: {{ $labels.merkmal }}
+            {{ if gt $value 0.0 }}zu hoch{{ else }}zu niedrig{{ end }}
+          description: >-
+            z = {{ printf "%.1f" $value }}: {{ $labels.merkmal }} weicht auf {{ $labels.instance }}
+            für sich allein deutlich vom Referenzbetrieb ab. Messstelle und Prozessgröße prüfen.
+
+      # B) Korrelationsbruch: anhaltend anomal, aber kein Einzelwert auffällig
+      - alert: MerkmalsZusammenhangGestoert
+        expr: |
+          avg_over_time(mahalanobis_anomalie[15m]) >= 0.5
+          unless ignoring(merkmal)
+          (abs(last_over_time(mahalanobis_z[10m])) >= 3)
+        for: 5m
+        keep_firing_for: 10m
+        labels:
+          severity: warning
+          typ: korrelationsbruch
+        annotations:
+          summary: "{{ $labels.instance }}: Zusammenhang der Messgrößen gestört"
+          description: >-
+            {{ $value | humanizePercentage }} der Messungen der letzten 15 min sind anomal, obwohl alle
+            Einzelwerte im Normalbereich liegen (|z| < 3). Stärkste Treiber (Leave-one-out):
+            {{ range query (printf "topk(3, last_over_time(mahalanobis_loo{instance='%s'}[10m]))" $labels.instance) }}{{ .Labels.merkmal }} ({{ printf "%.0f" .Value }}) {{ end }}.
+            Zusammenwirken dieser Größen prüfen (Regelkreis, Sensordrift, Leckage, Verschleiß).
+
+      # C) Kritisch: Distanz deutlich über der Schwelle (zusätzlich zu A/B, höhere Dringlichkeit)
+      - alert: AnomalieKritisch
+        expr: |
+          (
+            last_over_time(mahalanobis_d[10m])
+              / last_over_time(mahalanobis_schwelle_d[10m])
+          ) >= 2
+          and
+          avg_over_time(mahalanobis_anomalie[15m]) >= 0.5
+        for: 2m
+        keep_firing_for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.instance }}: starke Anomalie"
+          description: >-
+            Mahalanobis-Distanz liegt beim {{ printf "%.1f" $value }}-fachen der Schwelle.
+            Sofort prüfen; Details siehe gleichzeitige Alerts MerkmalAusserhalbNormalbereich
+            bzw. MerkmalsZusammenhangGestoert für {{ $labels.instance }}.
+
+      # D) Betriebszustand, der in der Referenz nicht vorkam
+      - alert: BetriebszustandAusserhalbReferenz
+        expr: max_over_time(mahalanobis_konstant_abweichung[15m]) == 1
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }}: {{ $labels.merkmal }} abweichend von der Referenz"
+          description: >-
+            {{ $labels.merkmal }} war in den Referenzdaten von {{ $labels.instance }} konstant und hat
+            jetzt einen anderen Wert. Die Anomaliebewertung ist für diesen Betriebszustand nicht
+            aussagekräftig. Ggf. eigene Referenzdaten je Betriebszustand verwenden.
+
+      # E) Schleichende Drift: mittlere Distanz steigt gegenüber der Vorwoche
+      #    (braucht mindestens 8 Tage Historie; bei gleitender Referenz wandert die Referenz mit,
+      #    deshalb erkennt diese Regel vor allem Veränderungen, die schneller als die Referenz sind)
+      - alert: MahalanobisDrift
+        expr: |
+          avg_over_time(mahalanobis_d[6h])
+            > 1.5 * avg_over_time(mahalanobis_d[7d] offset 1d)
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "{{ $labels.instance }}: schleichende Veränderung"
+          description: >-
+            Die mittlere Distanz der letzten 6 h liegt deutlich über dem Niveau der Vorwoche.
+            Mögliche Ursachen: Verschleiß, Sensordrift oder veraltete Referenzdaten.
+            Prozess prüfen und Referenz ggf. neu bestimmen.
+
+  - name: mahalanobis_service
+    interval: 1m
+    rules:
+
+      # F) Für eine Instanz kommen keine Analysewerte mehr (MetricsQL lag(), nur VictoriaMetrics)
+      #    Ursachen: Instanz liefert keine Rohdaten, zu wenig Referenzpunkte, Query-Problem
+      - alert: MahalanobisKeineDaten
+        expr: lag(mahalanobis_d[1d]) > 1800
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.instance }}: seit {{ $value | humanizeDuration }} keine Analysewerte"
+          description: >-
+            Für {{ $labels.instance }} werden keine Ergebnisse mehr geschrieben. Rohdaten der Instanz
+            und Log des Service prüfen (übersprungen wegen fehlender Merkmale oder Referenzpunkte?).
+
+      # G) Service läuft nicht (keine Laufmetrik mehr)
+      - alert: MahalanobisServiceInaktiv
+        expr: lag(mahalanobis_service_laufdauer_sekunden[1d]) > 1800
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mahalanobis-Service seit {{ $value | humanizeDuration }} ohne Lauf"
+          description: "Prozess/Container von mahalanobis_service.py und Erreichbarkeit von VictoriaMetrics prüfen."
+
+      # H) Service meldet Fehler oder übersprungene Instanzen
+      - alert: MahalanobisServiceProbleme
+        expr: |
+          max_over_time(mahalanobis_service_instanzen{status=~"fehler|uebersprungen"}[30m]) > 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "Mahalanobis-Service: {{ $value }} Instanz(en) mit Status {{ $labels.status }}"
+          description: "Details im Log des Service (Meldungen 'übersprungen' bzw. 'fehlgeschlagen')."

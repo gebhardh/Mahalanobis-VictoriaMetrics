@@ -1,0 +1,87 @@
+# Mahalanobis-Anomalieerkennung für Linux-Hosts mit Telegraf
+# 12 Linux-Merkmale + 3 Telegraf-Merkmale je Host.
+#
+# Passt zu diesen Telegraf-Inputs: cpu (totalcpu = true), system, mem, kernel, kernel_vmstat,
+# diskio, net, nstat, internal, procstat (pattern = "telegraf").
+# Metriknamen = <measurement>_<field>, wie Telegraf sie an VictoriaMetrics schreibt.
+#
+# Einsatz als eigene Konfiguration:
+#   sudo mahalanobis-neu linux   ->  Inhalt hierher kopieren und anpassen
+#
+# Anpassen:
+#   - read_url / write_url
+#   - Gruppierungs-Label: Hier "instance". Tragen deine Telegraf-Metriken den Host stattdessen im
+#     Standard-Tag "host", überall "instance" durch "host" ersetzen (auch in group_labels).
+#   - Filter für Disks (name=~...) und Netzwerk-Interfaces (interface!~...), siehe unten
+#   - Hosts einschränken, z. B. {instance=~"q556|q556d"} in jeder Query ergänzen
+
+victoriametrics:
+  read_url: http://localhost:8428
+  write_url: http://localhost:8428/api/v1/import/prometheus
+
+schedule: {interval: 5m, step: 1m, delay: 1m}
+reference:
+  window: 7d
+  end_offset: 1d          # Störungen unter 1 Tag gelangen nicht in die Referenz
+  min_points: 1000
+  clean_quantile: 0.9999  # deutliche Ausreißer (Wartung, Incidents) aus der Referenz entfernen;
+                          # 0.999 entfernt mehr, kann aber normale Lastspitzen mitnehmen
+analysis:
+  schwelle: empirisch     # Server-Metriken sind nicht normalverteilt (Tagesgang, Spitzen)
+
+group_labels: [instance]
+
+metrics:
+  # ---------------------------------------------------------------- CPU und Last
+  # CPU-Auslastung gesamt in % (report_active = false, daher 100 - idle)
+  cpu_usage:        '100 - max by (instance) (cpu_usage_idle{cpu="cpu-total"})'
+  # Anteil I/O-Wait in %: CPU wartet auf Platte
+  cpu_iowait:       'max by (instance) (cpu_usage_iowait{cpu="cpu-total"})'
+  # Load (5 min) je CPU-Kern: > 1 = mehr lauffähige Prozesse als Kerne
+  load_per_cpu:     'max by (instance) (system_load5) / max by (instance) (system_n_cpus)'
+  # Kontextwechsel pro Sekunde
+  context_switches: 'sum by (instance) (rate(kernel_context_switches[5m]))'
+
+  # ---------------------------------------------------------------- Speicher
+  # verfügbarer Arbeitsspeicher in %
+  mem_available:    'max by (instance) (mem_available_percent)'
+  # Major Page Faults pro Sekunde: Seiten müssen von Platte/Swap nachgeladen werden (Speicherdruck)
+  major_faults:     'sum by (instance) (rate(kernel_vmstat_pgmajfault[5m]))'
+
+  # ---------------------------------------------------------------- Platten
+  # Nur ganze Platten (keine Partitionen, Loop-, RAM- oder Device-Mapper-Geräte),
+  # sonst werden Bytes doppelt gezählt. Regex bei Bedarf an deine Gerätenamen anpassen.
+  # Auslastung der am stärksten belasteten Platte (0..1, aus io_time in ms/s)
+  disk_util:        'max by (instance) (rate(diskio_io_time{name=~"(sd|vd|xvd|hd)[a-z]+|nvme[0-9]+n[0-9]+"}[5m])) / 1000'
+  # gelesene Bytes pro Sekunde, alle Platten
+  disk_read:        'sum by (instance) (rate(diskio_read_bytes{name=~"(sd|vd|xvd|hd)[a-z]+|nvme[0-9]+n[0-9]+"}[5m]))'
+  # geschriebene Bytes pro Sekunde, alle Platten
+  disk_write:       'sum by (instance) (rate(diskio_write_bytes{name=~"(sd|vd|xvd|hd)[a-z]+|nvme[0-9]+n[0-9]+"}[5m]))'
+
+  # ---------------------------------------------------------------- Netzwerk
+  # Bytes pro Sekunde über physische Interfaces (ohne lo und virtuelle Bridges/Container-Interfaces)
+  net_recv:         'sum by (instance) (rate(net_bytes_recv{interface!~"lo|docker.*|veth.*|br-.*|virbr.*|cni.*|flannel.*"}[5m]))'
+  net_sent:         'sum by (instance) (rate(net_bytes_sent{interface!~"lo|docker.*|veth.*|br-.*|virbr.*|cni.*|flannel.*"}[5m]))'
+  # TCP-Retransmit-Quote: wiederholte / gesendete Segmente (Netzqualität, unabhängig von der Menge)
+  tcp_retrans:      'sum by (instance) (rate(nstat_TcpRetransSegs[5m])) / clamp_min(sum by (instance) (rate(nstat_TcpOutSegs[5m])), 1)'
+
+  # ---------------------------------------------------------------- Telegraf selbst
+  # erfasste Metriken pro Sekunde (bricht ein Input weg, sinkt der Wert)
+  tg_gathered:      'sum by (instance) (rate(internal_agent_metrics_gathered[5m]))'
+  # Rückstau im Ausgabepuffer (Metriken), alle Outputs; steigt, wenn das Ziel nicht erreichbar ist
+  tg_buffer:        'sum by (instance) (avg_over_time(internal_write_buffer_size[5m]))'
+  # CPU-Verbrauch des Telegraf-Prozesses in % eines Kerns (procstat, pattern = "telegraf")
+  tg_cpu:           'sum by (instance) (avg_over_time(procstat_cpu_usage{pattern="telegraf"}[5m]))'
+
+output:
+  labels: {modell: linux, funktion: server}
+
+# Bewusst NICHT als Merkmal aufgenommen, besser als einfache Alert-Regel:
+#   - disk_used_percent, swap_used_percent: Trends bzw. Zustände, keine Lastmuster
+#     z. B.  max by (instance) (disk_used_percent{fstype!~"tmpfs|overlay"}) > 90
+#   - Fehler- und Verlustzähler (fast immer 0): net_err_in/out, net_drop_in/out,
+#     internal_agent_metrics_dropped, internal_agent_gather_errors, internal_write_errors
+#     z. B.  sum by (instance) (rate(internal_agent_metrics_dropped[5m])) > 0
+#   - processes_blocked / processes_zombies: meist 0
+#   - systemd_units: fehlgeschlagene Dienste (active_code = 3 laut Telegraf-Doku)
+#     z. B.  count by (instance) (systemd_units_active_code == 3) > 0
